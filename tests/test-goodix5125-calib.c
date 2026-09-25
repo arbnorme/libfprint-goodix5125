@@ -336,6 +336,69 @@ test_pack_total_len (void)
   g_assert_cmpuint (goodix_pack_total_len (two, 3), ==, 0);
 }
 
+static void
+test_engine_prep (void)
+{
+  guint16 pix[G5125_PIXELS];
+  guint8 out[G5125_PIXELS];
+
+  for (int i = 0; i < G5125_PIXELS; i++)
+    pix[i] = 1000;
+  pix[10 * G5125_WIDTH + 10] = 1090;
+  g5125_engine_prep (pix, out);
+  /* 3x3 mean around the peak is 1010: 128 + 80 * 1.5 = 248 */
+  g_assert_cmpuint (out[10 * G5125_WIDTH + 10], ==, 248);
+  /* its neighbour: 128 + (1000 - 1010) * 1.5 = 113 */
+  g_assert_cmpuint (out[10 * G5125_WIDTH + 11], ==, 113);
+  g_assert_cmpuint (out[40 * G5125_WIDTH + 40], ==, 128);
+}
+
+static void
+test_engine_prep_clamps (void)
+{
+  guint16 pix[G5125_PIXELS];
+  guint8 out[G5125_PIXELS];
+
+  for (int y = 0; y < G5125_HEIGHT; y++)
+    for (int x = 0; x < G5125_WIDTH; x++)
+      pix[y * G5125_WIDTH + x] = x < 32 ? 0 : 4000;
+  g5125_engine_prep (pix, out);
+  g_assert_cmpuint (out[40 * G5125_WIDTH + 31], ==, 0);
+  g_assert_cmpuint (out[40 * G5125_WIDTH + 32], ==, 255);
+  g_assert_cmpuint (out[40 * G5125_WIDTH + 10], ==, 128);
+}
+
+static void
+test_template_roundtrip (void)
+{
+  static const guint8 blob[5] = { 1, 2, 3, 4, 5 };
+  g_autoptr(GVariant) v = g_variant_ref_sink (g5125_template_to_variant (blob, sizeof blob));
+  const guint8 *out = NULL;
+  gsize len = 0;
+
+  g_assert_true (g5125_template_from_variant (v, &out, &len));
+  g_assert_cmpmem (out, len, blob, sizeof blob);
+}
+
+static void
+test_template_rejects_bad_data (void)
+{
+  static const guint8 blob[3] = { 9, 9, 9 };
+  const guint8 *out = NULL;
+  gsize len = 0;
+  g_autoptr(GVariant) unversioned = g_variant_ref_sink (
+    g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, sizeof blob, 1));
+  g_autoptr(GVariant) v2 = g_variant_ref_sink (
+    g_variant_new ("(y@ay)", 2, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, sizeof blob, 1)));
+  g_autoptr(GVariant) empty = g_variant_ref_sink (
+    g_variant_new ("(y@ay)", G5125_TEMPLATE_VERSION, g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, 0, 1)));
+
+  g_assert_false (g5125_template_from_variant (NULL, &out, &len));
+  g_assert_false (g5125_template_from_variant (unversioned, &out, &len));
+  g_assert_false (g5125_template_from_variant (v2, &out, &len));
+  g_assert_false (g5125_template_from_variant (empty, &out, &len));
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -360,5 +423,9 @@ main (int argc, char *argv[])
   g_test_add_func ("/goodix5125/tls/records-complete", test_tls_records_complete);
   g_test_add_func ("/goodix5125/transport/error-domain", test_goodix_error_domain);
   g_test_add_func ("/goodix5125/transport/pack-total-len", test_pack_total_len);
+  g_test_add_func ("/goodix5125/engine/prep", test_engine_prep);
+  g_test_add_func ("/goodix5125/engine/prep-clamps", test_engine_prep_clamps);
+  g_test_add_func ("/goodix5125/template/roundtrip", test_template_roundtrip);
+  g_test_add_func ("/goodix5125/template/rejects-bad-data", test_template_rejects_bad_data);
   return g_test_run ();
 }

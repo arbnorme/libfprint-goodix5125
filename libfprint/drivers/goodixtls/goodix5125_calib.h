@@ -36,6 +36,9 @@
 #define G5125_IRQ_FINGER_DOWN 0x0002
 #define G5125_IRQ_REVERSE     0x0080
 #define G5125_IRQ_REVERSE2    0x0082
+#define G5125_ENGINE_GAIN     1.5f  /* high-pass gain the Goodix engine matches best with */
+#define G5125_MATCH_THRESHOLD 30    /* minimum engine score for a match */
+#define G5125_TEMPLATE_VERSION 1
 
 typedef struct
 {
@@ -75,3 +78,10 @@ gboolean g5125_decode_image (const guint8 *plain,
                              guint16       pix[G5125_PIXELS]);
 void     g5125_image_to_8bit (const guint16 pix[G5125_PIXELS],
                               guint8        out[G5125_PIXELS]);
+void     g5125_engine_prep (const guint16 pix[G5125_PIXELS],
+                            guint8        out[G5125_PIXELS]);
+GVariant *g5125_template_to_variant (const guint8 *blob,
+                                     gsize         len);
+gboolean g5125_template_from_variant (GVariant      *v,
+                                      const guint8 **blob,
+                                      gsize         *len);

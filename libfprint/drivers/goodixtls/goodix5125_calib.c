@@ -17,6 +17,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <gio/gio.h>
@@ -259,4 +260,48 @@ g5125_image_to_8bit (const guint16 pix[G5125_PIXELS], guint8 out[G5125_PIXELS])
 
       out[i] = hi > lo ? (guint8) ((c - lo) * 255 / (hi - lo)) : 0;
     }
+}
+
+void
+g5125_engine_prep (const guint16 pix[G5125_PIXELS], guint8 out[G5125_PIXELS])
+{
+  /* 3x3 high-pass around 128: the form the Goodix engine matches best with */
+  for (int y = 0; y < G5125_HEIGHT; y++)
+    for (int x = 0; x < G5125_WIDTH; x++)
+      {
+        gint sum = 0, n = 0;
+        gint v;
+
+        for (int yy = MAX (0, y - 1); yy <= MIN (G5125_HEIGHT - 1, y + 1); yy++)
+          for (int xx = MAX (0, x - 1); xx <= MIN (G5125_WIDTH - 1, x + 1); xx++)
+            {
+              sum += pix[yy * G5125_WIDTH + xx];
+              n++;
+            }
+        v = (gint) lroundf (128.0f + (pix[y * G5125_WIDTH + x] - (gfloat) sum / n) * G5125_ENGINE_GAIN);
+        out[y * G5125_WIDTH + x] = (guint8) CLAMP (v, 0, 255);
+      }
+}
+
+GVariant *
+g5125_template_to_variant (const guint8 *blob, gsize len)
+{
+  return g_variant_new ("(y@ay)", G5125_TEMPLATE_VERSION,
+                        g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, len, 1));
+}
+
+gboolean
+g5125_template_from_variant (GVariant *v, const guint8 **blob, gsize *len)
+{
+  g_autoptr(GVariant) data = NULL;
+  guint8 version;
+
+  if (!v || !g_variant_is_of_type (v, G_VARIANT_TYPE ("(yay)")))
+    return FALSE;
+  g_variant_get (v, "(y@ay)", &version, &data);
+  if (version != G5125_TEMPLATE_VERSION)
+    return FALSE;
+  /* data is owned by v, so the pointer stays valid as long as v does */
+  *blob = g_variant_get_fixed_array (data, len, 1);
+  return *len > 0;
 }
