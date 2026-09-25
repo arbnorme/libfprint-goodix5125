@@ -27,8 +27,13 @@ match threshold at engine score 30:
 | Offline, 24 captures of other fingers | 0 of 24 accepted |
 | Driver, enrolled finger | 8 of 13 recognised |
 | Driver, other fingers | 0 of 19 accepted |
+| `fprintd-verify`, enrolled finger (moved a little each time) | 15 of 20 recognised |
+| `fprintd-verify`, four other fingers | 0 of 20 accepted |
 
-Expect roughly every second touch to be recognised; lift and touch again if
+Screen unlock, `sudo` and verification after suspend/resume work with
+`fprintd` (SELinux enforcing, `MemoryDenyWriteExecute` kept).
+
+Expect roughly three of four touches to be recognised; lift and touch again if
 it fails. Enrolling carefully helps a lot: rest the finger about a second
 per touch and move it a little each time (tip, centre, left, right, up,
 down).
