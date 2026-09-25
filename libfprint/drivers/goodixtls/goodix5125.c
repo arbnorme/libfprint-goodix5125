@@ -463,10 +463,16 @@ on_finger_down (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
     }
 
   irq = g5125_irq_status (data, length);
+  if (irq == G5125_IRQ_REVERSE || irq == G5125_IRQ_REVERSE2)
+    {
+      /* a lift without a touch, common while the finger settles: re-arm */
+      fp_dbg ("FDT reverse event, re-arming");
+      fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
+      return;
+    }
   if (irq != G5125_IRQ_FINGER_DOWN)
     {
-      if (soft_error (self, ssm, irq == G5125_IRQ_REVERSE || irq == G5125_IRQ_REVERSE2 ?
-                      "FDT reverse event" : "Unexpected FDT event"))
+      if (soft_error (self, ssm, "Unexpected FDT event"))
         fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
       return;
     }
