@@ -1,0 +1,84 @@
+#!/bin/bash
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# Fetch Goodix's matching engine (AlgoChicago.dll) for the goodixtls5125
+# driver. The DLL is proprietary and is never shipped with this project;
+# this script takes it straight from Goodix's official Windows driver
+# package on the Microsoft Update Catalog and checks its hash.
+#
+# Usage: sudo goodix5125-fetch-engine [--cab FILE]
+#   --cab FILE   use an already downloaded driver package instead
+#
+# DESTDIR is honoured for staged installs.
+
+set -euo pipefail
+
+CAB_URL="https://catalog.s.download.windowsupdate.com/d/msdownload/update/driver/drvs/2022/05/5f2cfe33-8430-4d88-a654-de241785f4dd_3032d6cda11d2be4d1a2f1fee770db85fe60442e.cab"
+CAB_SHA1="3032d6cda11d2be4d1a2f1fee770db85fe60442e"
+DLL_NAME="AlgoChicago.dll"
+DEST="${DESTDIR:-}/usr/lib64/libfprint-2/goodix5125/${DLL_NAME}"
+
+manual_route() {
+    cat >&2 <<EOF
+
+Manual route:
+  1. Open https://www.catalog.update.microsoft.com and search for
+       USB\\VID_27C6&PID_5125
+  2. Download the driver "Goodix FP - Biometric - 1.1.125.20"
+     (SHA-1 ${CAB_SHA1}).
+  3. Run: sudo $0 --cab /path/to/the/downloaded.cab
+EOF
+    exit 1
+}
+
+cab=""
+if [ "${1:-}" = "--cab" ]; then
+    [ -n "${2:-}" ] || { echo "--cab needs a file" >&2; exit 2; }
+    cab="$2"
+elif [ $# -gt 0 ]; then
+    echo "Usage: $0 [--cab FILE]" >&2
+    exit 2
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+if [ -z "$cab" ]; then
+    cab="$tmp/goodix.cab"
+    echo "Downloading the Goodix driver package from the Microsoft Update Catalog..."
+    if ! curl -fL --retry 2 -o "$cab" "$CAB_URL"; then
+        echo "Download failed." >&2
+        manual_route
+    fi
+fi
+
+if [ "$(sha1sum "$cab" | cut -d' ' -f1)" != "$CAB_SHA1" ]; then
+    echo "Hash mismatch: $cab is not the expected driver package." >&2
+    manual_route
+fi
+
+if command -v cabextract >/dev/null; then
+    cabextract -q -d "$tmp/x" -F "$DLL_NAME" "$cab"
+elif command -v 7z >/dev/null; then
+    7z e -y -bso0 -bsp0 -o"$tmp/x" "$cab" "$DLL_NAME"
+else
+    echo "Need cabextract or 7z to unpack the driver package (dnf install cabextract)." >&2
+    exit 1
+fi
+
+[ -f "$tmp/x/$DLL_NAME" ] || { echo "$DLL_NAME not found in the package." >&2; exit 1; }
+
+install -Dm644 "$tmp/x/$DLL_NAME" "$DEST"
+echo "Installed $DEST"
+
+cat <<EOF
+
+Next steps:
+  1. On SELinux systems (Fedora), load the policy module once:
+       cd /usr/share/libfprint-goodix5125/selinux
+       checkmodule -M -m -o /tmp/goodix5125-engine.mod goodix5125-engine.te
+       semodule_package -o /tmp/goodix5125-engine.pp -m /tmp/goodix5125-engine.mod
+       sudo semodule -i /tmp/goodix5125-engine.pp
+  2. Restart fprintd:  sudo systemctl restart fprintd
+  3. Enrol a finger:   fprintd-enroll
+EOF

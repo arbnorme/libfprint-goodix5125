@@ -1,0 +1,27 @@
+# SELinux policy for the goodixtls5125 engine loader.
+#
+# Adapted from goodix-5e0a packaging/selinux/goodix-engine.te
+# (LGPL-2.1-or-later).
+#
+# The driver loads Goodix's AlgoChicago.dll by writing it into an anonymous
+# memfd and mapping it in-process (W^X, so fprintd keeps
+# MemoryDenyWriteExecute). Stock policy denies fprintd_t write, map, read
+# and execute on tmpfs memfd files, so opening the sensor fails on
+# enforcing systems.
+#
+# Build and install:
+#   checkmodule -M -m -o goodix5125-engine.mod goodix5125-engine.te
+#   semodule_package -o goodix5125-engine.pp -m goodix5125-engine.mod
+#   sudo semodule -i goodix5125-engine.pp
+#
+# Remove with: sudo semodule -r goodix5125-engine
+
+module goodix5125-engine 1.0;
+
+require {
+    type fprintd_t;
+    type tmpfs_t;
+    class file { execute map read write };
+}
+
+allow fprintd_t tmpfs_t:file { execute map read write };

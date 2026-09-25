@@ -1,7 +1,7 @@
 Name:           libfprint
 
 Version:        1.94.100
-Release:        100.goodix5125.1%{?dist}
+Release:        100.goodix5125.2%{?dist}
 Summary:        Toolkit for fingerprint scanner
 
 # Automatically converted from old format: LGPLv2+ - review is highly recommended.
@@ -10,8 +10,11 @@ Summary:        Toolkit for fingerprint scanner
 License:        LGPL-2.1-or-later AND NIST-PD
 URL:            https://github.com/arbnorme/libfprint-goodix5125
 # libfprint %%{version} plus the goodixtls5125 driver for Goodix 27c6:5125
-%global srctag  %{version}-goodix5125.1
+%global srctag  %{version}-goodix5125.2
 Source0:        %{url}/archive/refs/tags/v%{srctag}/libfprint-goodix5125-%{srctag}.tar.gz
+
+# The goodixtls5125 matching engine is a Windows x86-64 DLL loaded in-process
+ExclusiveArch:  x86_64
 
 BuildRequires:  meson
 BuildRequires:  gcc
@@ -32,11 +35,17 @@ BuildRequires:  gobject-introspection-devel
 BuildRequires:  python3-cairo python3-gobject cairo-devel
 BuildRequires:  umockdev >= 0.13.2
 
+# goodix5125-fetch-engine downloads and unpacks the Goodix driver package
+Requires:       curl
+Recommends:     cabextract
+
 %description
 libfprint offers support for consumer fingerprint reader devices.
 
 This build adds the goodixtls5125 driver for the Goodix 27c6:5125
-fingerprint sensor (e.g. Huawei MateBook 16).
+fingerprint sensor (e.g. Huawei MateBook 16). Matching uses Goodix's
+proprietary engine, which is not included: run goodix5125-fetch-engine
+to download it from the Microsoft Update Catalog.
 
 %package        devel
 Summary:        Development files for %{name}
@@ -64,6 +73,9 @@ the functionality of the installed %{name} package.
 
 %install
 %meson_install
+install -Dm755 scripts/goodix5125-fetch-engine %{buildroot}%{_bindir}/goodix5125-fetch-engine
+install -Dm644 packaging/selinux/goodix5125-engine.te \
+    %{buildroot}%{_datadir}/libfprint-goodix5125/selinux/goodix5125-engine.te
 
 %ldconfig_scriptlets
 
@@ -78,6 +90,8 @@ the functionality of the installed %{name} package.
 %{_udevhwdbdir}/60-autosuspend-libfprint-2.hwdb
 %{_udevrulesdir}/70-libfprint-2.rules
 %{_datadir}/metainfo/org.freedesktop.libfprint.metainfo.xml
+%{_bindir}/goodix5125-fetch-engine
+%{_datadir}/libfprint-goodix5125/
 
 %files devel
 %doc HACKING.md
@@ -92,6 +106,10 @@ the functionality of the installed %{name} package.
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Fri Sep 25 2026 arbnorme <arbnorme@users.noreply.github.com> - 1.94.100-100.goodix5125.2
+- goodixtls5125: match with the Goodix engine instead of NBIS
+- Add goodix5125-fetch-engine and the goodix5125-engine SELinux module
+
 * Fri Sep 25 2026 arbnorme <arbnorme@users.noreply.github.com> - 1.94.100-100.goodix5125.1
 - Add goodixtls5125 driver for the Goodix 27c6:5125 fingerprint sensor
 
