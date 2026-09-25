@@ -53,6 +53,14 @@ typedef struct _GoodixTlsServer
  * @param error output error
  * @return gboolean TRUE on success, FALSE otherwise
  */
+gboolean goodix_tls_records_complete (const guint8 *buf,
+                                      gsize         len);
+
+int goodix_tls_client_read_records (GoodixTlsServer *self,
+                                    guint8          *buf,
+                                    gsize            max,
+                                    int              quiet_ms);
+
 gboolean goodix_tls_server_init (GoodixTlsServer *self,
                                  GError         **error);
 

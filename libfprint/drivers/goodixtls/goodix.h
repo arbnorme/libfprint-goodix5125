@@ -37,7 +37,14 @@ struct _FpiDeviceGoodixTlsClass
   gint               interface;
   guint8             ep_in;
   guint8             ep_out;
+  guint8             get_image_cmd;
 };
+
+#define GOODIX_ERROR (goodix_error_quark ())
+GQuark goodix_error_quark (void);
+enum { GOODIX_ERROR_TLS_RECONNECT = 1 };
+
+gboolean goodix_take_tls_reconnect_request (FpDevice *dev);
 
 typedef struct __attribute__((__packed__)) _GoodixCallbackInfo
 {

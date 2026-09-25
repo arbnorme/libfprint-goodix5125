@@ -49,6 +49,7 @@
 #define GOODIX_CMD_TLS_SUCCESSFULLY_ESTABLISHED (0xd4)
 #define GOODIX_CMD_PRESET_PSK_WRITE (0xe0)
 #define GOODIX_CMD_PRESET_PSK_READ (0xe4)
+#define GOODIX_CMD_NOTICE_TLS_RECONNECT (0xda)
 
 typedef struct __attribute__((__packed__)) _GoodixPack
 {

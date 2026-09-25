@@ -42,15 +42,11 @@
 static GError *
 err_from_ssl (void)
 {
-  GError *err = malloc (sizeof (GError));
   unsigned long code = ERR_get_error ();
-
-  err->code = code;
   const char *msg = ERR_reason_error_string (code);
 
-  err->message = malloc (strlen (msg));
-  strcpy (err->message, msg);
-  return err;
+  return g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED, "TLS error: %s",
+                      msg ? msg : "unknown");
 }
 
 static unsigned int
@@ -99,6 +95,48 @@ tls_server_config_ctx (SSL_CTX *ctx)
   SSL_CTX_set_min_proto_version (ctx, TLS1_2_VERSION);
   SSL_CTX_set_max_proto_version (ctx, TLS1_2_VERSION);
   SSL_CTX_set_psk_server_callback (ctx, tls_server_psk_server_callback);
+}
+
+gboolean
+goodix_tls_records_complete (const guint8 *buf, gsize len)
+{
+  gsize off = 0;
+
+  if (len == 0)
+    return FALSE;
+  while (off + 5 <= len)
+    {
+      gsize rl = (gsize) buf[off + 3] << 8 | buf[off + 4];
+
+      if (off + 5 + rl > len)
+        return FALSE;
+      off += 5 + rl;
+    }
+  return off == len;
+}
+
+int
+goodix_tls_client_read_records (GoodixTlsServer *self, guint8 *buf,
+                                gsize max, int quiet_ms)
+{
+  gsize have = 0;
+
+  for (;;)
+    {
+      gboolean complete = goodix_tls_records_complete (buf, have);
+      struct pollfd p = { .fd = self->client_fd, .events = POLLIN };
+      int pr = poll (&p, 1, complete ? quiet_ms : 3000);
+      ssize_t n;
+
+      if (pr <= 0)
+        return complete ? (int) have : -1;
+      n = read (self->client_fd, buf + have, max - have);
+      if (n <= 0)
+        return complete ? (int) have : -1;
+      have += n;
+      if (have == max)
+        return goodix_tls_records_complete (buf, have) ? (int) have : -1;
+    }
 }
 
 int

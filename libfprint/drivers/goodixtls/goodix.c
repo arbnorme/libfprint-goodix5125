@@ -57,10 +57,24 @@ typedef struct
 
   GCancellable       *transfer_cancel_tkn;
   gboolean            inited;
+  gboolean            tls_reconnect_requested;
 } FpiDeviceGoodixTlsPrivate;
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE (FpiDeviceGoodixTls, fpi_device_goodixtls,
                                      FP_TYPE_IMAGE_DEVICE);
+
+G_DEFINE_QUARK (goodix-error-quark, goodix_error)
+
+gboolean
+goodix_take_tls_reconnect_request (FpDevice *dev)
+{
+  FpiDeviceGoodixTlsPrivate *priv =
+    fpi_device_goodixtls_get_instance_private (FPI_DEVICE_GOODIXTLS (dev));
+  gboolean r = priv->tls_reconnect_requested;
+
+  priv->tls_reconnect_requested = FALSE;
+  return r;
+}
 
 // TODO remove every GDestroyNotify
 // TODO add cmd timeouts
@@ -349,6 +363,18 @@ goodix_receive_protocol (FpDevice *dev, guint8 *data, guint32 length)
       return;
     }
 
+  if (cmd == GOODIX_CMD_NOTICE_TLS_RECONNECT)
+    {
+      fp_warn ("Device requested TLS reconnect (0xda)");
+      if (priv->ack || priv->reply)
+        goodix_receive_done (dev, NULL, 0,
+                             g_error_new (GOODIX_ERROR, GOODIX_ERROR_TLS_RECONNECT,
+                                          "Device requested TLS reconnect"));
+      else
+        priv->tls_reconnect_requested = TRUE;
+      return;
+    }
+
   if (priv->cmd != cmd)
     {
       fp_warn ("Invalid protocol command: 0x%02x", cmd);
@@ -630,13 +656,13 @@ goodix_send_mcu_get_image (FpDevice *dev, GoodixImageCallback callback,
       cb_info->callback = G_CALLBACK (callback);
       cb_info->user_data = user_data;
 
-      goodix_send_protocol (dev, GOODIX_CMD_MCU_GET_IMAGE, (guint8 *) &payload,
+      goodix_send_protocol (dev, FPI_DEVICE_GOODIXTLS_GET_CLASS (dev)->get_image_cmd, (guint8 *) &payload,
                             sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
                             goodix_receive_default, cb_info);
       return;
     }
 
-  goodix_send_protocol (dev, GOODIX_CMD_MCU_GET_IMAGE, (guint8 *) &payload,
+  goodix_send_protocol (dev, FPI_DEVICE_GOODIXTLS_GET_CLASS (dev)->get_image_cmd, (guint8 *) &payload,
                         sizeof (payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
                         NULL, NULL);
 }
@@ -648,15 +674,6 @@ goodix_send_mcu_switch_to_fdt_down (FpDevice *dev, const guint8 *mode, guint16 l
                                     gpointer user_data)
 {
   GoodixCallbackInfo *cb_info = NULL;
-
-
-  guint8 * payload = malloc (sizeof (guint8) * (length + 1));
-
-  memcpy (payload + 1, mode, length);
-  payload[0] = 0xc;
-  if (free_func)
-    free_func ((void *) mode);
-
   GoodixDefaultCallback cb = NULL;
 
   if (callback)
@@ -667,8 +684,8 @@ goodix_send_mcu_switch_to_fdt_down (FpDevice *dev, const guint8 *mode, guint16 l
       cb_info->user_data = user_data;
       cb = goodix_receive_default;
     }
-  goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN, payload, length + 1,
-                        free, TRUE, 0, TRUE, cb,
+  goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN, mode, length,
+                        free_func, TRUE, 0, TRUE, cb,
                         cb_info);
 
 }
@@ -680,13 +697,6 @@ goodix_send_mcu_switch_to_fdt_up (FpDevice *dev, const guint8 *mode, guint16 len
                                   gpointer user_data)
 {
   GoodixCallbackInfo *cb_info = NULL;
-
-  guint8 * payload = malloc (sizeof (guint8) * (length + 1));
-
-  memcpy (payload + 1, mode, length);
-  payload[0] = 0xe;
-  if (free_func)
-    free_func ((void *) mode);
   GoodixDefaultCallback cb = NULL;
 
   if (callback)
@@ -699,8 +709,8 @@ goodix_send_mcu_switch_to_fdt_up (FpDevice *dev, const guint8 *mode, guint16 len
 
     }
 
-  goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP, payload, length + 1,
-                        free, TRUE, 0, TRUE, cb,
+  goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP, mode, length,
+                        free_func, TRUE, 0, TRUE, cb,
                         cb_info);
 }
 
@@ -1309,8 +1319,8 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
 
   if (stage == TLS_HANDSHAKE_STAGE_HELLO_S)
     {
-      guint8 buff[1024];
-      int size = goodix_tls_client_read (priv->tls_hop, buff, sizeof (buff));
+      guint8 buff[4096];
+      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), 200);
       if (size < 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
@@ -1335,8 +1345,8 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
   else if (stage == TLS_HANDSHAKE_STAGE_CHANGE_CIPHER_S)
     {
       fp_dbg ("Reading to proxy back");
-      guint8 buff[1024];
-      int size = goodix_tls_client_read (priv->tls_hop, buff, sizeof (buff));
+      guint8 buff[4096];
+      int size = goodix_tls_client_read_records (priv->tls_hop, buff, sizeof (buff), 200);
       if (size < 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
@@ -1499,4 +1509,5 @@ fpi_device_goodixtls_init (FpiDeviceGoodixTls *self)
 static void
 fpi_device_goodixtls_class_init (FpiDeviceGoodixTlsClass *class)
 {
+  class->get_image_cmd = GOODIX_CMD_MCU_GET_IMAGE;
 }

@@ -20,7 +20,12 @@
 #include <string.h>
 #include <glib.h>
 
+#include <pthread.h>
+#include <openssl/ssl.h>
+
 #include "drivers/goodixtls/goodix5125_calib.h"
+#include "drivers/goodixtls/goodix.h"
+#include "drivers/goodixtls/goodixtls.h"
 
 /* Synthetic OTP: invented bytes (NOT from any real sensor) with valid
  * 51x0-layout CRCs. otp[42] = 0x6e, DAC bytes b0 b3 b1 b2. */
@@ -274,6 +279,32 @@ test_image_to_8bit (void)
   g_assert_cmpuint (out[0], ==, 0);
 }
 
+static void
+test_tls_records_complete (void)
+{
+  /* ChangeCipherSpec record, then a Finished header announcing 0x28 bytes */
+  static const guint8 ccs[6] = { 0x14, 0x03, 0x03, 0x00, 0x01, 0x01 };
+  guint8 buf[6 + 5 + 0x28];
+
+  g_assert_true (goodix_tls_records_complete (ccs, sizeof ccs));
+  g_assert_false (goodix_tls_records_complete (ccs, 3));
+  g_assert_false (goodix_tls_records_complete (ccs, 0));
+
+  memcpy (buf, ccs, 6);
+  buf[6] = 0x16; buf[7] = 0x03; buf[8] = 0x03; buf[9] = 0x00; buf[10] = 0x28;
+  memset (buf + 11, 0xaa, 0x28);
+  g_assert_false (goodix_tls_records_complete (buf, 6 + 5 + 10));   /* partial Finished */
+  g_assert_true (goodix_tls_records_complete (buf, sizeof buf));
+}
+
+static void
+test_goodix_error_domain (void)
+{
+  g_autoptr(GError) e = g_error_new (GOODIX_ERROR, GOODIX_ERROR_TLS_RECONNECT, "x");
+
+  g_assert_true (g_error_matches (e, GOODIX_ERROR, GOODIX_ERROR_TLS_RECONNECT));
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -294,5 +325,7 @@ main (int argc, char *argv[])
   g_test_add_func ("/goodix5125/image/decode-crops-to-64", test_decode_image_crops_to_64);
   g_test_add_func ("/goodix5125/image/decode-wrong-length", test_decode_image_wrong_length);
   g_test_add_func ("/goodix5125/image/to-8bit", test_image_to_8bit);
+  g_test_add_func ("/goodix5125/tls/records-complete", test_tls_records_complete);
+  g_test_add_func ("/goodix5125/transport/error-domain", test_goodix_error_domain);
   return g_test_run ();
 }
