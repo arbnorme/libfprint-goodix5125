@@ -1298,12 +1298,37 @@ on_tls_successfully_established (FpDevice *dev, gpointer user_data,
     dev, priv->tls_ready_callback->user_data, NULL);
   g_clear_pointer (&priv->tls_ready_callback, g_free);
 }
+/* Hand a TLS setup failure to whoever called goodix_tls_init(). */
+static void
+tls_ready_fail (FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodixTlsPrivate *priv =
+    fpi_device_goodixtls_get_instance_private (FPI_DEVICE_GOODIXTLS (dev));
+  GoodixCallbackInfo *cb = g_steal_pointer (&priv->tls_ready_callback);
+
+  if (cb)
+    ((GoodixNoneCallback) cb->callback)(dev, cb->user_data, error);
+  else
+    g_error_free (error);
+  g_free (cb);
+}
+
 static void
 tls_handshake_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   if (error)
-    fp_dbg ("failed to do tls handshake: %s (code: %d)", error->message,
-            error->code);
+    {
+      fp_warn ("failed to do tls handshake: %s (code: %d)", error->message,
+               error->code);
+      tls_ready_fail (dev, fpi_device_error_new_msg (
+                        FP_DEVICE_ERROR_PROTO,
+                        "TLS handshake with the sensor failed (%s). The sensor's "
+                        "pre-shared key is probably not the all-zero key (e.g. it "
+                        "was provisioned by Windows); this driver does not "
+                        "re-provision sensors.", error->message));
+      g_error_free (error);
+      return;
+    }
   goodix_send_tls_successfully_established (
     dev, on_tls_successfully_established, NULL);
 }
@@ -1380,7 +1405,7 @@ on_goodix_request_tls_connection (FpDevice *dev, guint8 *data,
   if (error)
     {
       fp_err ("failed to get tls handshake: %s", error->message);
-      goodix_send_tls_successfully_established (FP_DEVICE (dev), NULL, NULL);
+      tls_ready_fail (dev, error);
       return;
     }
   FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (user_data);
@@ -1426,6 +1451,7 @@ goodix_tls_init (FpDevice *dev, GoodixNoneCallback callback, gpointer user_data)
     {
       fp_err ("failed to init tls server, error: %s, code: %d", err->message,
               err->code);
+      tls_ready_fail (dev, err);
       return;
     }
 
