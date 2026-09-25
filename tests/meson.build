@@ -321,7 +321,16 @@ if 'virtual_image' in drivers
     ]
 endif
 
+if 'goodixtls5125' in drivers
+    unit_tests += [ 'goodix5125-calib' ]
+endif
+
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
+
+if 'goodixtls5125' in drivers
+    # the calibration module lives in the drivers library, which unit tests do not link by default
+    unit_tests_deps += { 'goodix5125-calib' : [declare_dependency(link_with: libfprint_drivers)] }
+endif
 
 foreach test_name: unit_tests
     if unit_tests_deps.has_key(test_name)
