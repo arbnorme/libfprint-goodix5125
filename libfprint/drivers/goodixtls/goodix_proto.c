@@ -86,6 +86,17 @@ goodix_encode_protocol (guint8 cmd, const guint8 *payload, guint16 payload_len,
     (*data)[sizeof (GoodixProtocol) + payload_len] = GOODIX_NULL_CHECKSUM;
 }
 
+gsize
+goodix_pack_total_len (const guint8 *data, gsize data_len)
+{
+  gsize total;
+
+  if (data_len < sizeof (GoodixPack) + sizeof (guint8))
+    return 0;
+  total = sizeof (GoodixPack) + sizeof (guint8) + (data[1] | data[2] << 8);
+  return data_len >= total ? total : 0;
+}
+
 gboolean
 goodix_decode_pack (guint8 *data, guint32 data_len, guint8 *flags,
                     guint8 **payload, guint16 *payload_len,

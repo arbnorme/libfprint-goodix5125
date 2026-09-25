@@ -74,5 +74,4 @@ gboolean g5125_decode_image (const guint8 *plain,
                              gsize         len,
                              guint16       pix[G5125_PIXELS]);
 void     g5125_image_to_8bit (const guint16 pix[G5125_PIXELS],
-                              const guint16 *clear,
-                              guint8         out[G5125_PIXELS]);
+                              guint8        out[G5125_PIXELS]);

@@ -156,6 +156,11 @@ void goodix_encode_protocol (guint8        cmd,
                              guint8      **data,
                              guint32      *data_len);
 
+/* Total length (header + payload) of the first complete pack in data,
+ * or 0 if data does not yet hold a complete pack. */
+gsize goodix_pack_total_len (const guint8 *data,
+                             gsize         data_len);
+
 gboolean goodix_decode_pack (guint8   *data,
                              guint32   data_len,
                              guint8   *flags,

@@ -400,7 +400,6 @@ goodix_receive_pack (FpDevice *dev, guint8 *data, guint32 length)
   FpiDeviceGoodixTlsPrivate *priv =
     fpi_device_goodixtls_get_instance_private (self);
   guint8 flags;
-  g_autofree guint8 *payload = NULL;
   guint16 payload_len;
   gboolean valid_checksum; // TODO implement checksum.
 
@@ -408,36 +407,48 @@ goodix_receive_pack (FpDevice *dev, guint8 *data, guint32 length)
   memcpy (priv->data + priv->length, data, length);
   priv->length += length;
 
-  if (!goodix_decode_pack (priv->data, priv->length, &flags, &payload,
-                           &payload_len, &valid_checksum))
+  /* One USB transfer can carry several packs (e.g. an ACK directly followed
+   * by the command's reply): handle every complete pack, keep the rest. */
+  for (;;)
     {
-      // Packet is not full, we still need data.
-      fp_dbg ("not full packet");
-      return;
+      gsize total = goodix_pack_total_len (priv->data, priv->length);
+      g_autofree guint8 *payload = NULL;
+
+      if (total == 0)
+        {
+          if (priv->length)
+            fp_dbg ("not full packet");
+          return;
+        }
+      if (!goodix_decode_pack (priv->data, total, &flags, &payload,
+                               &payload_len, &valid_checksum))
+        return;
+
+      switch (flags)
+        {
+        case GOODIX_FLAGS_MSG_PROTOCOL:
+          fp_dbg ("Got protocol msg");
+          goodix_receive_protocol (dev, payload, payload_len);
+          break;
+
+        case GOODIX_FLAGS_TLS:
+          fp_dbg ("Got TLS msg");
+          goodix_receive_done (dev, payload, payload_len, NULL);
+          break;
+
+        default:
+          fp_warn ("Unknown flags: 0x%02x", flags);
+          break;
+        }
+
+      priv->length -= total;
+      if (priv->length == 0)
+        {
+          g_clear_pointer (&priv->data, g_free);
+          return;
+        }
+      memmove (priv->data, priv->data + total, priv->length);
     }
-
-  switch (flags)
-    {
-    case GOODIX_FLAGS_MSG_PROTOCOL:
-      fp_dbg ("Got protocol msg");
-      goodix_receive_protocol (dev, payload, payload_len);
-      break;
-
-    case GOODIX_FLAGS_TLS:
-      fp_dbg ("Got TLS msg");
-      goodix_receive_done (dev, payload, payload_len, NULL);
-
-      // TLS message sending it to TLS server.
-      // TODO
-      break;
-
-    default:
-      fp_warn ("Unknown flags: 0x%02x", flags);
-      break;
-    }
-
-  g_clear_pointer (&priv->data, g_free);
-  priv->length = 0;
 }
 
 void
@@ -723,9 +734,6 @@ goodix_send_mcu_switch_to_fdt_mode (FpDevice *dev, const guint8 *mode, guint16 l
   GoodixCallbackInfo *cb_info = NULL;
   GoodixDefaultCallback cb = NULL;
 
-  if (free_func)
-    free_func ((void *) mode);
-
   if (callback)
     {
       cb_info = malloc (sizeof (GoodixCallbackInfo));
@@ -735,8 +743,9 @@ goodix_send_mcu_switch_to_fdt_mode (FpDevice *dev, const guint8 *mode, guint16 l
       cb = goodix_receive_default;
     }
 
+  /* a manual FDT measurement always answers within a few ms */
   goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE, mode, length,
-                        NULL, TRUE, 0, TRUE, cb,
+                        free_func, TRUE, GOODIX_TIMEOUT, TRUE, cb,
                         cb_info);
 
 }

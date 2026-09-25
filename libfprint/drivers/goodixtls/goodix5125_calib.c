@@ -17,6 +17,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stdlib.h>
 #include <string.h>
 #include <gio/gio.h>
 
@@ -228,20 +229,34 @@ g5125_decode_image (const guint8 *plain, gsize len, guint16 pix[G5125_PIXELS])
   return TRUE;
 }
 
-void
-g5125_image_to_8bit (const guint16 pix[G5125_PIXELS], const guint16 *clear,
-                     guint8 out[G5125_PIXELS])
+static gint
+cmp_gint (gconstpointer a, gconstpointer b)
 {
-  gint lo = G_MAXINT, hi = G_MININT;
-  gint v[G5125_PIXELS];
+  gint x = *(const gint *) a, y = *(const gint *) b;
+
+  return (x > y) - (x < y);
+}
+
+void
+g5125_image_to_8bit (const guint16 pix[G5125_PIXELS], guint8 out[G5125_PIXELS])
+{
+  gint v[G5125_PIXELS], sorted[G5125_PIXELS];
+  gint lo, hi;
+
+  /* a finger lowers the raw value: map low values (ridges) to bright */
+  for (int i = 0; i < G5125_PIXELS; i++)
+    v[i] = sorted[i] = -(gint) pix[i];
+
+  /* stretch between the 1st and 99th percentile so single hot or dead
+   * pixels do not squash the contrast */
+  qsort (sorted, G5125_PIXELS, sizeof (gint), cmp_gint);
+  lo = sorted[G5125_PIXELS / 100];
+  hi = sorted[G5125_PIXELS - 1 - G5125_PIXELS / 100];
 
   for (int i = 0; i < G5125_PIXELS; i++)
     {
-      /* a finger lowers the raw value; the difference makes ridges bright */
-      v[i] = clear ? (gint) clear[i] - (gint) pix[i] : -(gint) pix[i];
-      lo = MIN (lo, v[i]);
-      hi = MAX (hi, v[i]);
+      gint c = CLAMP (v[i], lo, hi);
+
+      out[i] = hi > lo ? (guint8) ((c - lo) * 255 / (hi - lo)) : 0;
     }
-  for (int i = 0; i < G5125_PIXELS; i++)
-    out[i] = hi > lo ? (guint8) ((v[i] - lo) * 255 / (hi - lo)) : 0;
 }

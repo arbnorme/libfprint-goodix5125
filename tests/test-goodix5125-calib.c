@@ -25,6 +25,7 @@
 
 #include "drivers/goodixtls/goodix5125_calib.h"
 #include "drivers/goodixtls/goodix.h"
+#include "drivers/goodixtls/goodix_proto.h"
 #include "drivers/goodixtls/goodixtls.h"
 
 /* Synthetic OTP: invented bytes (NOT from any real sensor) with valid
@@ -261,22 +262,37 @@ test_decode_image_wrong_length (void)
 static void
 test_image_to_8bit (void)
 {
-  guint16 pix[G5125_PIXELS], clear[G5125_PIXELS];
+  guint16 pix[G5125_PIXELS];
   guint8 out[G5125_PIXELS];
 
+  /* ridges (low raw values) come out bright */
   for (int i = 0; i < G5125_PIXELS; i++)
-    {
-      clear[i] = 2000;
-      pix[i] = 2000 - (i % 2 ? 400 : 0);  /* finger lowers values on odd pixels */
-    }
-  g5125_image_to_8bit (pix, clear, out);
-  g_assert_cmpuint (out[0], ==, 0);
+    pix[i] = i % 2 ? 1000 : 1400;
+  g5125_image_to_8bit (pix, out);
   g_assert_cmpuint (out[1], ==, 255);
+  g_assert_cmpuint (out[0], ==, 0);
 
   for (int i = 0; i < G5125_PIXELS; i++)
     pix[i] = 1000;             /* flat image must not divide by zero */
-  g5125_image_to_8bit (pix, NULL, out);
+  g5125_image_to_8bit (pix, out);
   g_assert_cmpuint (out[0], ==, 0);
+}
+
+static void
+test_image_to_8bit_ignores_outliers (void)
+{
+  guint16 pix[G5125_PIXELS];
+  guint8 out[G5125_PIXELS];
+
+  for (int i = 0; i < G5125_PIXELS; i++)
+    pix[i] = i % 2 ? 1000 : 1400;
+  pix[2] = 4095;               /* one hot pixel must not squash the contrast */
+  pix[4] = 0;                  /* nor one dead pixel */
+  g5125_image_to_8bit (pix, out);
+  g_assert_cmpuint (out[1], ==, 255);
+  g_assert_cmpuint (out[0], ==, 0);
+  g_assert_cmpuint (out[2], ==, 0);
+  g_assert_cmpuint (out[4], ==, 255);
 }
 
 static void
@@ -305,6 +321,21 @@ test_goodix_error_domain (void)
   g_assert_true (g_error_matches (e, GOODIX_ERROR, GOODIX_ERROR_TLS_RECONNECT));
 }
 
+static void
+test_pack_total_len (void)
+{
+  /* ACK pack (4-byte header + 6 payload bytes) directly followed by the
+   * start of an FDT reply pack, as they can arrive in one USB transfer. */
+  static const guint8 two[] = {
+    0xa0, 0x06, 0x00, 0xa6, 0xb0, 0x03, 0x00, 0x36, 0x01, 0xe0,
+    0xa0, 0x14, 0x00, 0xb4, 0x36, 0x11, 0x00,
+  };
+
+  g_assert_cmpuint (goodix_pack_total_len (two, sizeof two), ==, 10);
+  g_assert_cmpuint (goodix_pack_total_len (two + 10, sizeof two - 10), ==, 0);  /* incomplete */
+  g_assert_cmpuint (goodix_pack_total_len (two, 3), ==, 0);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -325,7 +356,9 @@ main (int argc, char *argv[])
   g_test_add_func ("/goodix5125/image/decode-crops-to-64", test_decode_image_crops_to_64);
   g_test_add_func ("/goodix5125/image/decode-wrong-length", test_decode_image_wrong_length);
   g_test_add_func ("/goodix5125/image/to-8bit", test_image_to_8bit);
+  g_test_add_func ("/goodix5125/image/to-8bit-outliers", test_image_to_8bit_ignores_outliers);
   g_test_add_func ("/goodix5125/tls/records-complete", test_tls_records_complete);
   g_test_add_func ("/goodix5125/transport/error-domain", test_goodix_error_domain);
+  g_test_add_func ("/goodix5125/transport/pack-total-len", test_pack_total_len);
   return g_test_run ();
 }

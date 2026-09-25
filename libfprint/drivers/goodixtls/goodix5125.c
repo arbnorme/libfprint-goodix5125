@@ -28,6 +28,7 @@
 #define G5125_MAX_SOFT_ERRORS 3
 #define G5125_CHIP_ID         0x2504
 #define G5125_PSK_FLAGS       0xbb020003
+#define G5125_SCALE           2
 
 struct _FpiDeviceGoodixTls5125
 {
@@ -36,8 +37,6 @@ struct _FpiDeviceGoodixTls5125
   G5125Calib         calib;
   guint8             base[G5125_FDT_BASE_LEN];
   guint8             up_base[G5125_FDT_BASE_LEN];
-  guint16            clear_img[G5125_PIXELS];
-  gboolean           have_clear_img;
   FpiSsm            *scan_ssm;
   gboolean           deactivating;
   guint              soft_errors;
@@ -93,14 +92,16 @@ enum activate_states {
   ACT_CONFIG,
   ACT_SCAN_FREQ,
   ACT_TLS,
-  ACT_CLEAR_FDT,
-  ACT_CLEAR_IMAGE,
+  ACT_FDT,
   ACT_NUM,
 };
 
 static void measure_fdt (FpDevice     *dev,
                          FpiSsm       *ssm,
                          const guint8 *base);
+static gboolean scan_stop_if_deactivating (FpiDeviceGoodixTls5125 *self,
+                                           FpiSsm                 *ssm,
+                                           GError                **error);
 
 static void
 on_none (FpDevice *dev, gpointer ssm, GError *error)
@@ -232,11 +233,8 @@ on_fdt_measured (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
   guint16 raw[G5125_CHANNELS];
 
-  if (self->deactivating)
-    {
-      g_clear_error (&error);
-      return;
-    }
+  if (scan_stop_if_deactivating (self, ssm, &error))
+    return;
   if (error)
     {
       fpi_ssm_mark_failed (ssm, error);
@@ -272,23 +270,6 @@ measure_fdt (FpDevice *dev, FpiSsm *ssm, const guint8 *base)
 
   goodix_send_mcu_switch_to_fdt_mode (dev, payload, n, g_free,
                                       on_fdt_measured, ssm);
-}
-
-static void
-on_clear_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
-                GError *error)
-{
-  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (ssm, error);
-      return;
-    }
-  self->have_clear_img = g5125_decode_image (data, length, self->clear_img);
-  if (!self->have_clear_img)
-    fp_warn ("Clear image has unexpected length %u; continuing without", length);
-  fpi_ssm_next_state (ssm);
 }
 
 static void
@@ -366,13 +347,9 @@ activate_ssm_run (FpiSsm *ssm, FpDevice *dev)
       goodix_tls_init (dev, on_none, ssm);
       break;
 
-    case ACT_CLEAR_FDT:
+    case ACT_FDT:
       self->soft_errors = 0;
       measure_fdt (dev, ssm, g5125_fdt_start_base);
-      break;
-
-    case ACT_CLEAR_IMAGE:
-      goodix_tls_read_image (dev, on_clear_image, ssm);
       break;
     }
 }
@@ -383,6 +360,232 @@ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
   if (!error)
     fp_dbg ("Activation complete");
   fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
+}
+
+/* ---- scanning ------------------------------------------------------------ */
+
+enum scan_states {
+  SCAN_MEASURE,
+  SCAN_ARM_DOWN,
+  SCAN_GET_IMAGE,
+  SCAN_ARM_UP,
+  SCAN_TLS_RECONNECT,
+  SCAN_NUM,
+};
+
+static gboolean
+soft_error (FpiDeviceGoodixTls5125 *self, FpiSsm *ssm, const char *what)
+{
+  if (++self->soft_errors > G5125_MAX_SOFT_ERRORS)
+    {
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (
+                             FP_DEVICE_ERROR_PROTO, "%s (%u times in a row)",
+                             what, self->soft_errors - 1));
+      return FALSE;
+    }
+  fp_warn ("%s, retrying", what);
+  return TRUE;
+}
+
+/* Deactivation can happen synchronously inside libfprint calls we make from
+ * a callback (image_captured, report_finger_status). Every scan callback and
+ * state checks this and ends the scan machine instead of continuing. */
+static gboolean
+scan_stop_if_deactivating (FpiDeviceGoodixTls5125 *self, FpiSsm *ssm, GError **error)
+{
+  if (!self->deactivating)
+    return FALSE;
+  if (error)
+    g_clear_error (error);
+  if (ssm == self->scan_ssm)
+    fpi_ssm_mark_completed (ssm);
+  return TRUE;
+}
+
+static void
+on_finger_down (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+                GError *error)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  guint16 raw[G5125_CHANNELS];
+  guint16 irq;
+
+  if (scan_stop_if_deactivating (self, ssm, &error))
+    return;
+  if (g_error_matches (error, GOODIX_ERROR, GOODIX_ERROR_TLS_RECONNECT))
+    {
+      g_error_free (error);
+      if (soft_error (self, ssm, "TLS reconnect requested"))
+        fpi_ssm_jump_to_state (ssm, SCAN_TLS_RECONNECT);
+      return;
+    }
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  irq = g5125_irq_status (data, length);
+  if (irq != G5125_IRQ_FINGER_DOWN)
+    {
+      if (soft_error (self, ssm, irq == G5125_IRQ_REVERSE || irq == G5125_IRQ_REVERSE2 ?
+                      "FDT reverse event" : "Unexpected FDT event"))
+        fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
+      return;
+    }
+  /* Up base from the finger-down readings (Windows: "get fdt-up base"). */
+  if (!g5125_fdt_channels (data, length, raw) || !g5125_fdt_base (raw, self->up_base))
+    memcpy (self->up_base, self->base, sizeof self->up_base);
+  self->soft_errors = 0;
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+          GError *error)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  guint16 pix[G5125_PIXELS];
+  FpImage *img, *scaled;
+
+  if (scan_stop_if_deactivating (self, ssm, &error))
+    return;
+  if (error)
+    {
+      g_error_free (error);
+      if (soft_error (self, ssm, "No image after get-image"))
+        fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
+      return;
+    }
+  if (!g5125_decode_image (data, length, pix))
+    {
+      if (soft_error (self, ssm, "Image has unexpected length"))
+        fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
+      return;
+    }
+
+  img = fp_image_new (G5125_WIDTH, G5125_HEIGHT);
+  g5125_image_to_8bit (pix, img->data);
+  /* 64x80 is too small for NBIS minutiae detection; scale like other
+   * small-area drivers (elanspi, egis0570). Ridges come out bright. */
+  scaled = fpi_image_resize (img, G5125_SCALE, G5125_SCALE);
+  g_object_unref (img);
+  scaled->flags |= FPI_IMAGE_PARTIAL | FPI_IMAGE_COLORS_INVERTED;
+  fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), scaled);
+  /* may have deactivated us synchronously */
+  if (scan_stop_if_deactivating (self, ssm, NULL))
+    return;
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+on_finger_up (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
+              GError *error)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  if (scan_stop_if_deactivating (self, ssm, &error))
+    return;
+  if (g_error_matches (error, GOODIX_ERROR, GOODIX_ERROR_TLS_RECONNECT))
+    {
+      g_error_free (error);
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+      if (!scan_stop_if_deactivating (self, ssm, NULL))
+        fpi_ssm_jump_to_state (ssm, SCAN_TLS_RECONNECT);
+      return;
+    }
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+  /* Complete first: reporting finger-off may deactivate us synchronously. */
+  fpi_ssm_mark_completed (ssm);
+  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
+}
+
+static void
+on_tls_reinit (FpDevice *dev, gpointer ssm, GError *error)
+{
+  if (scan_stop_if_deactivating (FPI_DEVICE_GOODIXTLS5125 (dev), ssm, &error))
+    return;
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+  fpi_ssm_jump_to_state (ssm, SCAN_MEASURE);
+}
+
+static void
+scan_ssm_run (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  if (scan_stop_if_deactivating (self, ssm, NULL))
+    return;
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case SCAN_MEASURE:
+      if (goodix_take_tls_reconnect_request (dev))
+        {
+          fpi_ssm_jump_to_state (ssm, SCAN_TLS_RECONNECT);
+          return;
+        }
+      measure_fdt (dev, ssm, self->base);
+      break;
+
+    case SCAN_ARM_DOWN:
+      {
+        guint8 *p = g_malloc (2 + G5125_FDT_BASE_LEN + 2);
+        gsize n = g5125_fdt_payload (G5125_FDT_OP_DOWN, self->base, TRUE,
+                                     g5125_timestamp_now (), p);
+
+        goodix_send_mcu_switch_to_fdt_down (dev, p, n, g_free, on_finger_down, ssm);
+        break;
+      }
+
+    case SCAN_GET_IMAGE:
+      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
+      goodix_tls_read_image (dev, on_image, ssm);
+      break;
+
+    case SCAN_ARM_UP:
+      {
+        guint8 *p = g_malloc (2 + G5125_FDT_BASE_LEN);
+        gsize n = g5125_fdt_payload (G5125_FDT_OP_UP, self->up_base, FALSE, 0, p);
+
+        goodix_send_mcu_switch_to_fdt_up (dev, p, n, g_free, on_finger_up, ssm);
+        break;
+      }
+
+    case SCAN_TLS_RECONNECT:
+      {
+        g_autoptr(GError) err = NULL;
+
+        goodix_shutdown_tls (dev, &err);
+        goodix_tls_init (dev, on_tls_reinit, ssm);
+        break;
+      }
+    }
+}
+
+static void
+scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  self->scan_ssm = NULL;
+  if (self->deactivating)
+    {
+      g_clear_error (&error);
+      self->deactivating = FALSE;
+      fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
+      return;
+    }
+  if (error)
+    fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
 }
 
 /* ---- device ops ---------------------------------------------------------- */
@@ -412,15 +615,49 @@ dev_activate (FpImageDevice *img_dev)
 
   self->deactivating = FALSE;
   self->soft_errors = 0;
-  self->have_clear_img = FALSE;
   fpi_ssm_start (fpi_ssm_new (FP_DEVICE (img_dev), activate_ssm_run, ACT_NUM),
                  activate_complete);
 }
 
 static void
+dev_change_state (FpImageDevice *img_dev, FpiImageDeviceState state)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (img_dev);
+
+  if (state != FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON || self->scan_ssm)
+    return;
+  self->soft_errors = 0;
+  self->scan_ssm = fpi_ssm_new (FP_DEVICE (img_dev), scan_ssm_run, SCAN_NUM);
+  fpi_ssm_start (self->scan_ssm, scan_complete);
+}
+
+/* Runs from the main loop, after the callback that triggered deactivation
+ * has returned. If the scan machine is still waiting for the device (whose
+ * pending command was dropped), end it here. */
+static void
+deactivate_deferred (FpDevice *dev, gpointer user_data)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  if (self->scan_ssm)
+    fpi_ssm_mark_completed (self->scan_ssm);   /* scan_complete finishes deactivation */
+  else if (self->deactivating)
+    {
+      self->deactivating = FALSE;
+      fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
+    }
+}
+
+static void
 dev_deactivate (FpImageDevice *img_dev)
 {
-  fpi_image_device_deactivate_complete (img_dev, NULL);
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (img_dev);
+  g_autoptr(GError) err = NULL;
+
+  self->deactivating = TRUE;
+  goodix_reset_state (FP_DEVICE (img_dev));   /* drop any pending FDT wait */
+  goodix_shutdown_tls (FP_DEVICE (img_dev), &err);
+  fpi_device_add_timeout (FP_DEVICE (img_dev), 0, deactivate_deferred, NULL, NULL);
 }
 
 static void
@@ -451,8 +688,9 @@ fpi_device_goodixtls5125_class_init (FpiDeviceGoodixTls5125Class *class)
   img_class->img_close = dev_deinit;
   img_class->activate = dev_activate;
   img_class->deactivate = dev_deactivate;
-  img_class->img_width = G5125_WIDTH;
-  img_class->img_height = G5125_HEIGHT;
+  img_class->change_state = dev_change_state;
+  img_class->img_width = G5125_WIDTH * G5125_SCALE;
+  img_class->img_height = G5125_HEIGHT * G5125_SCALE;
   img_class->bz3_threshold = 24;
 
   fpi_device_class_auto_initialize_features (dev_class);
