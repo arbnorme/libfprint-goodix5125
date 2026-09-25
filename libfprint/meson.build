@@ -140,6 +140,7 @@ driver_sources = {
         'drivers/goodixtls/goodixtls.c',
         'drivers/goodixtls/goodix5125.c',
         'drivers/goodixtls/goodix5125_calib.c',
+        'drivers/goodixtls/goodix_engine.c',
     ),
     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
     'realtek' : files('drivers/realtek/realtek.c'),
