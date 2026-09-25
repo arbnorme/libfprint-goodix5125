@@ -1,3 +1,76 @@
+# libfprint with a driver for the Goodix 27c6:5125 fingerprint sensor
+
+This is [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint) 1.94.100
+(the version Fedora 44 ships) plus a new driver, **goodixtls5125**, for the
+Goodix `27c6:5125` fingerprint sensor found in the power button of the
+Huawei MateBook 16. With it, the unmodified `fprintd` can enroll fingers and
+use them for login, screen unlock and `sudo`.
+
+> **Status: experimental.** Tested on one Huawei MateBook 16 with Fedora 44.
+> It is not part of upstream libfprint.
+
+## Supported hardware
+
+| USB ID | Chip ID | Tested on |
+|---|---|---|
+| `27c6:5125` | `0x2504` | Huawei MateBook 16 (2021), Fedora 44 |
+
+The driver checks the chip ID and refuses other sensors.
+
+## Install (Fedora, via COPR)
+
+```sh
+sudo dnf copr enable arbnorme/libfprint-goodix5125
+sudo dnf upgrade --refresh libfprint
+sudo systemctl restart fprintd
+```
+
+Then enroll a finger in *GNOME Settings → Users → Fingerprint Login*, or run
+`fprintd-enroll`.
+
+**The sensor is part of the power button: rest your finger on it lightly,
+do not press.** Pressing suspends the laptop.
+
+## Uninstall
+
+```sh
+sudo dnf copr disable arbnorme/libfprint-goodix5125
+sudo dnf distro-sync libfprint
+```
+
+## Known limitations
+
+- The sensor area is small (64 × 80 pixels). Enroll carefully, and cover
+  slightly different parts of the finger across the enroll steps.
+- The driver talks to the sensor over TLS with the all-zero pre-shared key.
+  A sensor that was provisioned with a different key (for example by a
+  Windows installation) is reported as unsupported; the driver never
+  rewrites the key.
+- There is no automated end-to-end test: a USB recording of a scan would
+  contain a decryptable fingerprint image. The hardware-independent parts
+  are covered by unit tests (`meson test goodix5125-calib`).
+
+## Reporting a bug
+
+```sh
+sudo systemctl stop fprintd
+sudo G_MESSAGES_DEBUG=all /usr/libexec/fprintd -t 2>&1 | tee fprintd.log
+# in a second terminal: fprintd-verify
+```
+
+Attach `fprintd.log` to an issue. Logs contain no images, but do not attach
+any `.pgm` image files; they show your fingerprint.
+
+## License and credits
+
+LGPL-2.1-or-later, like libfprint. The transport and TLS code is based on the
+`goodixtls` driver by the goodix-fp-linux-dev authors
+(<https://github.com/goodix-fp-linux-dev/libfprint>, LGPL-2.1-or-later), and the
+sensor configuration comes from
+[goodix-fp-dump](https://github.com/goodix-fp-linux-dev/goodix-fp-dump) (MIT).
+
+---
+
 
 
 <div align="center">
