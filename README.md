@@ -6,8 +6,18 @@ Goodix `27c6:5125` fingerprint sensor found in the power button of the
 Huawei MateBook 16. With it, the unmodified `fprintd` can enroll fingers and
 use them for login, screen unlock and `sudo`.
 
-> **Status: experimental.** Tested on one Huawei MateBook 16 with Fedora 44.
-> It is not part of upstream libfprint.
+> **⚠️ Status: not usable for login, `sudo` or unlocking.**
+> The driver talks to the sensor, detects a finger and captures real
+> fingerprint images, but **fingerprint recognition (matching) does not work**
+> on this sensor. Its 64 × 80 pixel area (about 3 × 4 mm) is too small for
+> the open-source matchers available to libfprint: NBIS finds too few
+> minutiae, and SIGFM (SIFT) cannot tell different fingers apart. Enrolment
+> succeeds, but verification either never matches or cannot be made safe.
+> Please do not install this expecting working fingerprint login.
+>
+> What this repository offers is a working capture driver as a basis for
+> anyone researching a matcher for small sensors. Tested on one Huawei
+> MateBook 16 with Fedora 44. It is not part of upstream libfprint.
 
 ## Supported hardware
 
@@ -17,31 +27,37 @@ use them for login, screen unlock and `sudo`.
 
 The driver checks the chip ID and refuses other sensors.
 
-## Install (Fedora, via COPR)
+## Build (for development only)
+
+There is no binary package, because the driver is not usable for login yet.
+To build and try image capture:
 
 ```sh
-sudo dnf copr enable arbnorme/libfprint-goodix5125
-sudo dnf upgrade --refresh libfprint
-sudo systemctl restart fprintd
+meson setup build -Ddrivers=goodixtls5125
+meson compile -C build
+meson test -C build goodix5125-calib
+build/examples/img-capture    # writes finger.pgm
 ```
 
-Then enroll a finger in *GNOME Settings → Users → Fingerprint Login*, or run
-`fprintd-enroll`.
+`packaging/libfprint.spec` builds a Fedora RPM from a release tag.
 
 **The sensor is part of the power button: rest your finger on it lightly,
 do not press.** Pressing suspends the laptop.
 
-## Uninstall
+## Going back to Fedora's libfprint
+
+If you installed a locally built RPM:
 
 ```sh
-sudo dnf copr disable arbnorme/libfprint-goodix5125
 sudo dnf distro-sync libfprint
 ```
 
 ## Known limitations
 
-- The sensor area is small (64 × 80 pixels). Enroll carefully, and cover
-  slightly different parts of the finger across the enroll steps.
+- **Matching does not work** (see Status). Measured on the development
+  device: libfprint's NBIS matcher scored 0 on every comparison; with a
+  SIGFM matcher and a 30-image enrolment, at a threshold that rejects other
+  fingers only 2 of 20 genuine attempts passed.
 - The driver talks to the sensor over TLS with the all-zero pre-shared key.
   A sensor that was provisioned with a different key (for example by a
   Windows installation) is reported as unsupported; the driver never
