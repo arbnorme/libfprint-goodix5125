@@ -24,11 +24,19 @@
 #include "goodix.h"
 #include "goodix5125.h"
 #include "goodix5125_calib.h"
+#include "goodix_engine.h"
 
 #define G5125_MAX_SOFT_ERRORS 3
 #define G5125_CHIP_ID         0x2504
 #define G5125_PSK_FLAGS       0xbb020003
-#define G5125_SCALE           2
+#define G5125_ENGINE_DEFAULT_PATH "/usr/lib64/libfprint-2/goodix5125/AlgoChicago.dll"
+
+typedef enum {
+  G5125_ACTION_NONE,
+  G5125_ACTION_ENROLL,
+  G5125_ACTION_VERIFY,
+  G5125_ACTION_IDENTIFY,
+} G5125Action;
 
 struct _FpiDeviceGoodixTls5125
 {
@@ -37,9 +45,21 @@ struct _FpiDeviceGoodixTls5125
   G5125Calib         calib;
   guint8             base[G5125_FDT_BASE_LEN];
   guint8             up_base[G5125_FDT_BASE_LEN];
+  FpiSsm            *act_ssm;
   FpiSsm            *scan_ssm;
-  gboolean           deactivating;
+  gboolean           deactivating;   /* an action is being cancelled or suspended */
+  gboolean           cancelling;
+  gboolean           suspending;
   guint              soft_errors;
+
+  G5125Action        action;
+  void              *enroll_ctx;
+  gint               enroll_stage;
+  gint               enroll_progress;
+  gboolean           frame_rejected;
+  FpiMatchResult     result;
+  FpPrint           *identified;
+  GError            *result_error;
 };
 
 G_DEFINE_TYPE (FpiDeviceGoodixTls5125, fpi_device_goodixtls5125,
@@ -354,12 +374,29 @@ activate_ssm_run (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
+static void start_scan (FpDevice *dev);
+static void action_stopped (FpDevice *dev);
+static void action_finish (FpDevice *dev, GError *error);
+
 static void
 activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  if (!error)
-    fp_dbg ("Activation complete");
-  fpi_image_device_activate_complete (FP_IMAGE_DEVICE (dev), error);
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  self->act_ssm = NULL;
+  if (self->deactivating)
+    {
+      g_clear_error (&error);
+      action_stopped (dev);
+      return;
+    }
+  if (error)
+    {
+      action_finish (dev, error);
+      return;
+    }
+  fp_dbg ("Activation complete");
+  start_scan (dev);
 }
 
 /* ---- scanning ------------------------------------------------------------ */
@@ -387,9 +424,9 @@ soft_error (FpiDeviceGoodixTls5125 *self, FpiSsm *ssm, const char *what)
   return TRUE;
 }
 
-/* Deactivation can happen synchronously inside libfprint calls we make from
- * a callback (image_captured, report_finger_status). Every scan callback and
- * state checks this and ends the scan machine instead of continuing. */
+/* Cancellation and suspend can arrive while a scan step is in flight. Every
+ * scan callback and state checks this and ends the scan machine instead of
+ * continuing. */
 static gboolean
 scan_stop_if_deactivating (FpiDeviceGoodixTls5125 *self, FpiSsm *ssm, GError **error)
 {
@@ -440,13 +477,98 @@ on_finger_down (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
   fpi_ssm_next_state (ssm);
 }
 
+/* Returns TRUE and the engine score if the frame matches the stored print. */
+static gboolean
+match_print (FpPrint *print, const guint8 *prep, gint *score, GError **error)
+{
+  g_autoptr(GVariant) data = NULL;
+  const guint8 *blob;
+  gsize len;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!g5125_template_from_variant (data, &blob, &len))
+    {
+      g_set_error (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_INVALID,
+                   "Stored print is not a goodixtls5125 engine template");
+      return FALSE;
+    }
+  *score = 0;
+  return goodix_engine_verify_image (prep, G5125_WIDTH, G5125_HEIGHT, blob, len, score) == 1 &&
+         *score >= G5125_MATCH_THRESHOLD;
+}
+
+static void
+handle_frame (FpDevice *dev, const guint16 pix[G5125_PIXELS])
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  guint8 prep[G5125_PIXELS];
+
+  g5125_engine_prep (pix, prep);
+
+  switch (self->action)
+    {
+    case G5125_ACTION_ENROLL:
+      {
+        gint enrolled = 0, progress = 0;
+        gint r = goodix_engine_enroll_add_image (self->enroll_ctx, prep, G5125_WIDTH,
+                                                 G5125_HEIGHT, &enrolled, &progress);
+
+        self->frame_rejected = (r != 0);
+        if (!self->frame_rejected)
+          {
+            self->enroll_stage++;
+            self->enroll_progress = progress;
+          }
+        fp_dbg ("Enroll frame: engine result %d, %d images, %d%%", r, enrolled, progress);
+        break;
+      }
+
+    case G5125_ACTION_VERIFY:
+      {
+        FpPrint *print = NULL;
+        gint score = 0;
+
+        fpi_device_get_verify_data (dev, &print);
+        self->result = match_print (print, prep, &score, &self->result_error) ?
+                       FPI_MATCH_SUCCESS : FPI_MATCH_FAIL;
+        fp_dbg ("Verify: score %d (threshold %d)", score, G5125_MATCH_THRESHOLD);
+        break;
+      }
+
+    case G5125_ACTION_IDENTIFY:
+      {
+        GPtrArray *prints = NULL;
+        gint best = -1;
+
+        fpi_device_get_identify_data (dev, &prints);
+        self->identified = NULL;
+        for (guint i = 0; prints && i < prints->len; i++)
+          {
+            g_autoptr(GError) err = NULL;
+            gint score = 0;
+
+            if (match_print (g_ptr_array_index (prints, i), prep, &score, &err) && score > best)
+              {
+                best = score;
+                self->identified = g_ptr_array_index (prints, i);
+              }
+          }
+        fp_dbg ("Identify: best score %d", best);
+        break;
+      }
+
+    case G5125_ACTION_NONE:
+    default:
+      break;
+    }
+}
+
 static void
 on_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
           GError *error)
 {
   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
   guint16 pix[G5125_PIXELS];
-  FpImage *img, *scaled;
 
   if (scan_stop_if_deactivating (self, ssm, &error))
     return;
@@ -464,17 +586,7 @@ on_image (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
       return;
     }
 
-  img = fp_image_new (G5125_WIDTH, G5125_HEIGHT);
-  g5125_image_to_8bit (pix, img->data);
-  /* 64x80 is too small for NBIS minutiae detection; scale like other
-   * small-area drivers (elanspi, egis0570). Ridges come out bright. */
-  scaled = fpi_image_resize (img, G5125_SCALE, G5125_SCALE);
-  g_object_unref (img);
-  scaled->flags |= FPI_IMAGE_PARTIAL | FPI_IMAGE_COLORS_INVERTED;
-  fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), scaled);
-  /* may have deactivated us synchronously */
-  if (scan_stop_if_deactivating (self, ssm, NULL))
-    return;
+  handle_frame (dev, pix);
   fpi_ssm_next_state (ssm);
 }
 
@@ -488,10 +600,9 @@ on_finger_up (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
     return;
   if (g_error_matches (error, GOODIX_ERROR, GOODIX_ERROR_TLS_RECONNECT))
     {
+      /* The frame is already handled; losing the lift-off event is harmless. */
       g_error_free (error);
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
-      if (!scan_stop_if_deactivating (self, ssm, NULL))
-        fpi_ssm_jump_to_state (ssm, SCAN_TLS_RECONNECT);
+      fpi_ssm_mark_completed (ssm);
       return;
     }
   if (error)
@@ -499,9 +610,7 @@ on_finger_up (FpDevice *dev, guint8 *data, guint16 length, gpointer ssm,
       fpi_ssm_mark_failed (ssm, error);
       return;
     }
-  /* Complete first: reporting finger-off may deactivate us synchronously. */
   fpi_ssm_mark_completed (ssm);
-  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
 }
 
 static void
@@ -542,12 +651,15 @@ scan_ssm_run (FpiSsm *ssm, FpDevice *dev)
         gsize n = g5125_fdt_payload (G5125_FDT_OP_DOWN, self->base, TRUE,
                                      g5125_timestamp_now (), p);
 
+        fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
+                                                 FP_FINGER_STATUS_NONE);
         goodix_send_mcu_switch_to_fdt_down (dev, p, n, g_free, on_finger_down, ssm);
         break;
       }
 
     case SCAN_GET_IMAGE:
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
+      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_PRESENT,
+                                               FP_FINGER_STATUS_NEEDED);
       goodix_tls_read_image (dev, on_image, ssm);
       break;
 
@@ -571,93 +683,315 @@ scan_ssm_run (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
+/* ---- actions ------------------------------------------------------------- */
+
+static void
+action_cleanup (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  g_autoptr(GError) err = NULL;
+
+  goodix_shutdown_tls (dev, &err);
+  g_clear_pointer (&self->enroll_ctx, goodix_engine_enroll_finish);
+  g_clear_error (&self->result_error);
+  self->identified = NULL;
+  self->action = G5125_ACTION_NONE;
+  self->deactivating = self->cancelling = self->suspending = FALSE;
+  fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
+                                           FP_FINGER_STATUS_NEEDED | FP_FINGER_STATUS_PRESENT);
+}
+
+/* Ends the current action with an error (or cancellation). */
+static void
+action_finish (FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  G5125Action action = self->action;
+
+  action_cleanup (dev);
+  switch (action)
+    {
+    case G5125_ACTION_ENROLL:
+      fpi_device_enroll_complete (dev, NULL, error);
+      break;
+
+    case G5125_ACTION_VERIFY:
+      fpi_device_verify_complete (dev, error);
+      break;
+
+    case G5125_ACTION_IDENTIFY:
+      fpi_device_identify_complete (dev, error);
+      break;
+
+    case G5125_ACTION_NONE:
+    default:
+      g_clear_error (&error);
+      break;
+    }
+}
+
+static void
+enroll_commit (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  FpPrint *print = NULL;
+  uint8_t *blob = NULL;
+  size_t len = 0;
+
+  if (goodix_engine_enroll_commit (self->enroll_ctx, &blob, &len) != 0 || !blob || len == 0)
+    {
+      free (blob);
+      action_finish (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                    "Goodix engine could not build the template"));
+      return;
+    }
+  fpi_device_get_enroll_data (dev, &print);
+  fpi_print_set_type (print, FPI_PRINT_RAW);
+  g_object_set (print, "fpi-data", g5125_template_to_variant (blob, len), NULL);
+  free (blob);
+  fp_dbg ("Enrolled: template %zu bytes", len);
+  action_cleanup (dev);
+  fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+}
+
 static void
 scan_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  gint stages = fp_device_get_nr_enroll_stages (dev);
 
   self->scan_ssm = NULL;
   if (self->deactivating)
     {
       g_clear_error (&error);
-      self->deactivating = FALSE;
-      fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
+      action_stopped (dev);
       return;
     }
   if (error)
-    fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
+    {
+      action_finish (dev, error);
+      return;
+    }
+
+  switch (self->action)
+    {
+    case G5125_ACTION_ENROLL:
+      if (self->frame_rejected)
+        {
+          fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                                      fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+          start_scan (dev);
+          return;
+        }
+      fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+      if (self->enroll_stage >= stages)
+        {
+          enroll_commit (dev);
+          return;
+        }
+      start_scan (dev);
+      return;
+
+    case G5125_ACTION_VERIFY:
+      if (self->result_error)
+        {
+          GError *err = g_steal_pointer (&self->result_error);
+
+          action_finish (dev, err);
+          return;
+        }
+      fpi_device_verify_report (dev, self->result, NULL, NULL);
+      action_cleanup (dev);
+      fpi_device_verify_complete (dev, NULL);
+      return;
+
+    case G5125_ACTION_IDENTIFY:
+      fpi_device_identify_report (dev, self->identified, NULL, NULL);
+      action_cleanup (dev);
+      fpi_device_identify_complete (dev, NULL);
+      return;
+
+    case G5125_ACTION_NONE:
+    default:
+      return;
+    }
+}
+
+static void
+start_scan (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  self->soft_errors = 0;
+  self->frame_rejected = FALSE;
+  self->scan_ssm = fpi_ssm_new (dev, scan_ssm_run, SCAN_NUM);
+  fpi_ssm_start (self->scan_ssm, scan_complete);
+}
+
+static void
+start_activation (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  self->soft_errors = 0;
+  self->act_ssm = fpi_ssm_new (dev, activate_ssm_run, ACT_NUM);
+  fpi_ssm_start (self->act_ssm, activate_complete);
+}
+
+static void
+start_action (FpDevice *dev, G5125Action action)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  self->action = action;
+  self->enroll_stage = 0;
+  self->enroll_progress = 0;
+  self->result = FPI_MATCH_FAIL;
+  if (action == G5125_ACTION_ENROLL)
+    {
+      gint max_images = 0;
+
+      self->enroll_ctx = goodix_engine_enroll_start (&max_images);
+      if (!self->enroll_ctx)
+        {
+          action_finish (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                        "Goodix engine could not start enrolment"));
+          return;
+        }
+    }
+  start_activation (dev);
+}
+
+/* The stopped action's machines have ended; finish the cancel or suspend. */
+static void
+action_stopped (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  if (self->suspending)
+    {
+      self->deactivating = FALSE;
+      fpi_device_suspend_complete (dev, NULL);
+      return;
+    }
+  action_finish (dev, g_error_new (G_IO_ERROR, G_IO_ERROR_CANCELLED, "Operation was cancelled"));
+}
+
+/* Runs from the main loop after the triggering callback has returned: end
+ * whichever machine is still waiting for a (now dropped) device reply. */
+static void
+stop_deferred (FpDevice *dev, gpointer user_data)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  if (!self->deactivating)
+    return;
+  if (self->act_ssm)
+    fpi_ssm_mark_completed (self->act_ssm);
+  else if (self->scan_ssm)
+    fpi_ssm_mark_completed (self->scan_ssm);
+  else
+    action_stopped (dev);
+}
+
+static void
+stop_action (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+  g_autoptr(GError) err = NULL;
+
+  self->deactivating = TRUE;
+  goodix_reset_state (dev);   /* drop any pending device command */
+  goodix_shutdown_tls (dev, &err);
+  fpi_device_add_timeout (dev, 0, stop_deferred, NULL, NULL);
 }
 
 /* ---- device ops ---------------------------------------------------------- */
 
 static void
-dev_init (FpImageDevice *img_dev)
+dev_open (FpDevice *dev)
+{
+  const char *dll = g_getenv ("GOODIX5125_ENGINE_DLL");
+  GError *error = NULL;
+
+  if (!dll || !*dll)
+    dll = G5125_ENGINE_DEFAULT_PATH;
+  if (!goodix_engine_init (dll, &error))
+    {
+      fpi_device_open_complete (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                                               "%s", error->message));
+      g_error_free (error);
+      return;
+    }
+  fp_info ("Goodix engine %s loaded", goodix_engine_get_version ());
+  goodix_dev_init (dev, &error);
+  fpi_device_open_complete (dev, error);
+}
+
+static void
+dev_close (FpDevice *dev)
 {
   GError *error = NULL;
 
-  goodix_dev_init (FP_DEVICE (img_dev), &error);
-  fpi_image_device_open_complete (img_dev, error);
+  goodix_dev_deinit (dev, &error);
+  fpi_device_close_complete (dev, error);
 }
 
 static void
-dev_deinit (FpImageDevice *img_dev)
+dev_enroll (FpDevice *dev)
 {
-  GError *error = NULL;
-
-  goodix_dev_deinit (FP_DEVICE (img_dev), &error);
-  fpi_image_device_close_complete (img_dev, error);
+  start_action (dev, G5125_ACTION_ENROLL);
 }
 
 static void
-dev_activate (FpImageDevice *img_dev)
+dev_verify (FpDevice *dev)
 {
-  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (img_dev);
-
-  self->deactivating = FALSE;
-  self->soft_errors = 0;
-  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (img_dev), activate_ssm_run, ACT_NUM),
-                 activate_complete);
+  start_action (dev, G5125_ACTION_VERIFY);
 }
 
 static void
-dev_change_state (FpImageDevice *img_dev, FpiImageDeviceState state)
+dev_identify (FpDevice *dev)
 {
-  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (img_dev);
-
-  if (state != FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON || self->scan_ssm)
-    return;
-  self->soft_errors = 0;
-  self->scan_ssm = fpi_ssm_new (FP_DEVICE (img_dev), scan_ssm_run, SCAN_NUM);
-  fpi_ssm_start (self->scan_ssm, scan_complete);
+  start_action (dev, G5125_ACTION_IDENTIFY);
 }
 
-/* Runs from the main loop, after the callback that triggered deactivation
- * has returned. If the scan machine is still waiting for the device (whose
- * pending command was dropped), end it here. */
 static void
-deactivate_deferred (FpDevice *dev, gpointer user_data)
+dev_cancel (FpDevice *dev)
 {
   FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
 
-  if (self->scan_ssm)
-    fpi_ssm_mark_completed (self->scan_ssm);   /* scan_complete finishes deactivation */
-  else if (self->deactivating)
-    {
-      self->deactivating = FALSE;
-      fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
-    }
+  if (self->action == G5125_ACTION_NONE || self->deactivating)
+    return;
+  self->cancelling = TRUE;
+  stop_action (dev);
 }
 
 static void
-dev_deactivate (FpImageDevice *img_dev)
+dev_suspend (FpDevice *dev)
 {
-  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (img_dev);
-  g_autoptr(GError) err = NULL;
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
 
-  self->deactivating = TRUE;
-  goodix_reset_state (FP_DEVICE (img_dev));   /* drop any pending FDT wait */
-  goodix_shutdown_tls (FP_DEVICE (img_dev), &err);
-  fpi_device_add_timeout (FP_DEVICE (img_dev), 0, deactivate_deferred, NULL, NULL);
+  if (self->action == G5125_ACTION_NONE)
+    {
+      fpi_device_suspend_complete (dev, NULL);
+      return;
+    }
+  self->suspending = TRUE;
+  stop_action (dev);
+}
+
+static void
+dev_resume (FpDevice *dev)
+{
+  FpiDeviceGoodixTls5125 *self = FPI_DEVICE_GOODIXTLS5125 (dev);
+
+  fpi_device_resume_complete (dev, NULL);
+  if (self->action != G5125_ACTION_NONE)
+    {
+      /* the sensor lost its state while suspended: activate from scratch */
+      self->suspending = FALSE;
+      start_activation (dev);
+    }
 }
 
 static void
@@ -670,7 +1004,6 @@ fpi_device_goodixtls5125_class_init (FpiDeviceGoodixTls5125Class *class)
 {
   FpiDeviceGoodixTlsClass *gx_class = FPI_DEVICE_GOODIXTLS_CLASS (class);
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (class);
-  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (class);
 
   gx_class->interface = 0;
   gx_class->ep_in = 0x81;
@@ -682,16 +1015,20 @@ fpi_device_goodixtls5125_class_init (FpiDeviceGoodixTls5125Class *class)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
-  dev_class->nr_enroll_stages = 20;
+  dev_class->nr_enroll_stages = 12;   /* the engine keeps at most 12 images */
 
-  img_class->img_open = dev_init;
-  img_class->img_close = dev_deinit;
-  img_class->activate = dev_activate;
-  img_class->deactivate = dev_deactivate;
-  img_class->change_state = dev_change_state;
-  img_class->img_width = G5125_WIDTH * G5125_SCALE;
-  img_class->img_height = G5125_HEIGHT * G5125_SCALE;
-  img_class->bz3_threshold = 24;
+  /* Matching is done by the Goodix engine, not libfprint's image pipeline */
+  dev_class->open = dev_open;
+  dev_class->close = dev_close;
+  dev_class->enroll = dev_enroll;
+  dev_class->verify = dev_verify;
+  dev_class->identify = dev_identify;
+  dev_class->cancel = dev_cancel;
+  dev_class->suspend = dev_suspend;
+  dev_class->resume = dev_resume;
 
+  /* drop what the image-device parent advertises (capture, print update) */
+  dev_class->capture = NULL;
+  dev_class->features = FP_DEVICE_FEATURE_NONE;
   fpi_device_class_auto_initialize_features (dev_class);
 }
